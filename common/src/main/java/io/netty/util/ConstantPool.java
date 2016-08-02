@@ -17,9 +17,9 @@
 package io.netty.util;
 
 import io.netty.util.internal.ObjectUtil;
+import io.netty.util.internal.PlatformDependent;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.util.concurrent.ConcurrentMap;
 
 /**
  * A pool of {@link Constant}s.
@@ -28,9 +28,9 @@ import java.util.Map;
  */
 public abstract class ConstantPool<T extends Constant<T>> {
 
-    private final Map<String, T> constants = new HashMap<String, T>();
+    private final ConcurrentMap<String, T> constants = PlatformDependent.newConcurrentHashMap();
 
-    private int nextId = 1;
+    private volatile int nextId = 1;
 
     /**
      * Shortcut of {@link #valueOf(String) valueOf(firstNameComponent.getName() + "#" + secondNameComponent)}.
@@ -55,17 +55,18 @@ public abstract class ConstantPool<T extends Constant<T>> {
      * @param name the name of the {@link Constant}
      */
     public T valueOf(String name) {
-        T c;
+        checkNotNullAndNotEmpty(name);
 
-        synchronized (constants) {
-            if (exists(name)) {
-                c = constants.get(name);
-            } else {
-                c = newInstance0(name);
+        T constant = constants.get(name);
+        if (constant == null) {
+            final T tempConstant = newInstance0(name);
+            constant = constants.putIfAbsent(name, tempConstant);
+            if (constant == null) {
+                return tempConstant;
             }
         }
 
-        return c;
+        return constant;
     }
 
     /**
@@ -73,34 +74,26 @@ public abstract class ConstantPool<T extends Constant<T>> {
      */
     public boolean exists(String name) {
         checkNotNullAndNotEmpty(name);
-        synchronized (constants) {
-            return constants.containsKey(name);
-        }
+        return constants.containsKey(name);
     }
 
     /**
      * Creates a new {@link Constant} for the given {@code name} or fail with an
      * {@link IllegalArgumentException} if a {@link Constant} for the given {@code name} exists.
      */
-    @SuppressWarnings("unchecked")
     public T newInstance(String name) {
         if (exists(name)) {
             throw new IllegalArgumentException(String.format("'%s' is already in use", name));
         }
 
-        T c = newInstance0(name);
-
-        return c;
+        return newInstance0(name);
     }
 
     // Be careful that this dose not check whether the argument is null or empty.
     private T newInstance0(String name) {
-        synchronized (constants) {
-            T c = newConstant(nextId, name);
-            constants.put(name, c);
-            nextId++;
-            return c;
-        }
+        T c = newConstant(nextId(), name);
+        constants.put(name, c);
+        return c;
     }
 
     private String checkNotNullAndNotEmpty(String name) {
@@ -116,11 +109,8 @@ public abstract class ConstantPool<T extends Constant<T>> {
     protected abstract T newConstant(int id, String name);
 
     @Deprecated
-    public final int nextId() {
-        synchronized (constants) {
-            int id = nextId;
-            nextId++;
-            return id;
-        }
+    public final synchronized int nextId() {
+        return nextId++;
     }
+
 }
