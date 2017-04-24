@@ -39,7 +39,7 @@ import java.nio.charset.UnsupportedCharsetException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeMap;
+import java.util.HashMap;
 
 import static io.netty.buffer.Unpooled.*;
 
@@ -79,8 +79,7 @@ public class HttpPostMultipartRequestDecoder implements InterfaceHttpPostRequest
     /**
      * HttpDatas as Map from Body
      */
-    private final Map<String, List<InterfaceHttpData>> bodyMapHttpData = new TreeMap<String, List<InterfaceHttpData>>(
-            CaseIgnoringComparator.INSTANCE);
+    private final Map<String, List<InterfaceHttpData>> bodyMapHttpData = new HashMap<String, List<InterfaceHttpData>>();
 
     /**
      * The current channelBuffer
@@ -680,7 +679,7 @@ public class HttpPostMultipartRequestDecoder implements InterfaceHttpPostRequest
     private InterfaceHttpData findMultipartDisposition() {
         int readerIndex = undecodedChunk.readerIndex();
         if (currentStatus == MultiPartStatus.DISPOSITION) {
-            currentFieldAttributes = new TreeMap<CharSequence, Attribute>(CaseIgnoringComparator.INSTANCE);
+            currentFieldAttributes = new HashMap<CharSequence, Attribute>();
         }
         // read many lines until empty line with newline found! Store all data
         while (!skipOneLine()) {

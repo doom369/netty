@@ -33,7 +33,7 @@ import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeMap;
+import java.util.HashMap;
 
 import static io.netty.buffer.Unpooled.*;
 
@@ -73,8 +73,7 @@ public class HttpPostStandardRequestDecoder implements InterfaceHttpPostRequestD
     /**
      * HttpDatas as Map from Body
      */
-    private final Map<String, List<InterfaceHttpData>> bodyMapHttpData = new TreeMap<String, List<InterfaceHttpData>>(
-            CaseIgnoringComparator.INSTANCE);
+    private final Map<String, List<InterfaceHttpData>> bodyMapHttpData = new HashMap<String, List<InterfaceHttpData>>();
 
     /**
      * The current channelBuffer
