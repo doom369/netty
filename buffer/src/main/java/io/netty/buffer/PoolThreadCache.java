@@ -288,7 +288,7 @@ final class PoolThreadCache {
     }
 
     private static <T> MemoryRegionCache<T> cache(MemoryRegionCache<T>[] cache, int sizeIdx) {
-        if (cache == null || sizeIdx > cache.length - 1) {
+        if (cache == null || sizeIdx >= cache.length) {
             return null;
         }
         return cache[sizeIdx];
