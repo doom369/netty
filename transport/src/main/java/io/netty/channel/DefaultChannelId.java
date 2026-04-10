@@ -272,7 +272,7 @@ public final class DefaultChannelId implements ChannelId {
 
     private static void appendHexBytes(StringBuilder buf, byte[] bytes) {
         for (byte b : bytes) {
-            buf.append(HEX_CHARS[(b >>> 4) & 0xF]);
+            buf.append(HEX_CHARS[(b & 0xFF) >>> 4]);
             buf.append(HEX_CHARS[b & 0xF]);
         }
     }
