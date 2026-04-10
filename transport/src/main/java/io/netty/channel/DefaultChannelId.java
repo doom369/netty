@@ -215,7 +215,7 @@ public final class DefaultChannelId implements ChannelId {
         int h = Arrays.hashCode(machineId);
         h = 31 * h + processId;
         h = 31 * h + sequence;
-        h = 31 * h + (int) (timestamp ^ (timestamp >>> 32));
+        h = 31 * h + Long.hashCode(timestamp);
         h = 31 * h + random;
         return h;
     }
