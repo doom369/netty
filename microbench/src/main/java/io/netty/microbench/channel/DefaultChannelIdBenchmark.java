@@ -44,14 +44,34 @@ public class DefaultChannelIdBenchmark extends AbstractMicrobenchmark {
     @Param({ "false", "true" })
     private boolean noUnsafe;
 
+    private DefaultChannelId channelId1;
+    private DefaultChannelId channelId2;
+
     @Setup(Level.Trial)
     public void setup() {
         System.setProperty("io.netty.noUnsafe", Boolean.valueOf(noUnsafe).toString());
+        channelId1 = DefaultChannelId.newInstance();
+        channelId2 = DefaultChannelId.newInstance();
     }
 
     @Benchmark
     public DefaultChannelId newInstance() {
         return DefaultChannelId.newInstance();
+    }
+
+    @Benchmark
+    public boolean equalsSame() {
+        return channelId1.equals(channelId1);
+    }
+
+    @Benchmark
+    public boolean equalsDifferent() {
+        return channelId1.equals(channelId2);
+    }
+
+    @Benchmark
+    public int hashCodeBenchmark() {
+        return channelId1.hashCode();
     }
 
 }
