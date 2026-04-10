@@ -23,10 +23,6 @@ import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
-import java.io.IOException;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
-import java.io.ObjectStreamField;
 import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.concurrent.ThreadLocalRandom;
@@ -34,7 +30,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static io.netty.util.internal.MacAddressUtil.defaultMachineId;
 import static io.netty.util.internal.MacAddressUtil.parseMAC;
-import static io.netty.util.internal.PlatformDependent.BIG_ENDIAN_NATIVE_ORDER;
 
 /**
  * The default {@link ChannelId} implementation.
@@ -54,15 +49,6 @@ public final class DefaultChannelId implements ChannelId {
     private static final AtomicInteger nextSequence = new AtomicInteger();
 
     private static final char[] HEX_CHARS = "0123456789abcdef".toCharArray();
-
-    /**
-     * Declare the serialized form to match the old field layout ({@code byte[] data} + {@code int hashCode})
-     * so that instances serialized by older versions can still be deserialized.
-     */
-    private static final ObjectStreamField[] serialPersistentFields = {
-        new ObjectStreamField("data", byte[].class),
-        new ObjectStreamField("hashCode", int.class),
-    };
 
     /**
      * Returns a new {@link DefaultChannelId} instance.
@@ -202,12 +188,12 @@ public final class DefaultChannelId implements ChannelId {
         return jmxPid(loader);
     }
 
-    private byte[] machineId;
-    private int processId;
-    private int sequence;
-    private long timestamp;
-    private int random;
-    private int hashCode;
+    private final byte[] machineId;
+    private final int processId;
+    private final int sequence;
+    private final long timestamp;
+    private final int random;
+    private final int hashCode;
 
     private transient String shortValue;
     private transient String longValue;
@@ -357,97 +343,5 @@ public final class DefaultChannelId implements ChannelId {
     @Override
     public String toString() {
         return asShortText();
-    }
-
-    // --- Serialization support (compatible with the old byte[]-based layout) ---
-
-    private void writeObject(ObjectOutputStream out) throws IOException {
-        final ObjectOutputStream.PutField fields = out.putFields();
-        fields.put("data", buildData());
-        fields.put("hashCode", hashCode);
-        out.writeFields();
-    }
-
-    private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
-        final ObjectInputStream.GetField fields = in.readFields();
-        final byte[] data = (byte[]) fields.get("data", null);
-        final int machineIdLen = data.length - PROCESS_ID_LEN - SEQUENCE_LEN - TIMESTAMP_LEN - RANDOM_LEN;
-        machineId = Arrays.copyOfRange(data, 0, machineIdLen);
-        int offset = machineIdLen;
-        processId = readInt(data, offset);
-        offset += Integer.BYTES;
-        sequence = readInt(data, offset);
-        offset += Integer.BYTES;
-        timestamp = readLong(data, offset);
-        offset += Long.BYTES;
-        random = readInt(data, offset);
-        hashCode = computeHashCode();
-    }
-
-    private byte[] buildData() {
-        final byte[] data = new byte[machineId.length + PROCESS_ID_LEN + SEQUENCE_LEN + TIMESTAMP_LEN + RANDOM_LEN];
-        int i = 0;
-        System.arraycopy(machineId, 0, data, i, machineId.length);
-        i += machineId.length;
-        writeInt(data, i, processId);
-        i += Integer.BYTES;
-        writeInt(data, i, sequence);
-        i += Integer.BYTES;
-        writeLong(data, i, timestamp);
-        i += Long.BYTES;
-        writeInt(data, i, random);
-        return data;
-    }
-
-    private static void writeInt(byte[] data, int i, int value) {
-        if (PlatformDependent.isUnaligned()) {
-            PlatformDependent.putInt(data, i, BIG_ENDIAN_NATIVE_ORDER ? value : Integer.reverseBytes(value));
-            return;
-        }
-        data[i] = (byte) (value >>> 24);
-        data[i + 1] = (byte) (value >>> 16);
-        data[i + 2] = (byte) (value >>> 8);
-        data[i + 3] = (byte) value;
-    }
-
-    private static void writeLong(byte[] data, int i, long value) {
-        if (PlatformDependent.isUnaligned()) {
-            PlatformDependent.putLong(data, i, BIG_ENDIAN_NATIVE_ORDER ? value : Long.reverseBytes(value));
-            return;
-        }
-        data[i] = (byte) (value >>> 56);
-        data[i + 1] = (byte) (value >>> 48);
-        data[i + 2] = (byte) (value >>> 40);
-        data[i + 3] = (byte) (value >>> 32);
-        data[i + 4] = (byte) (value >>> 24);
-        data[i + 5] = (byte) (value >>> 16);
-        data[i + 6] = (byte) (value >>> 8);
-        data[i + 7] = (byte) value;
-    }
-
-    private static int readInt(byte[] data, int i) {
-        if (PlatformDependent.isUnaligned()) {
-            int v = PlatformDependent.getInt(data, i);
-            return BIG_ENDIAN_NATIVE_ORDER ? v : Integer.reverseBytes(v);
-        }
-        return (data[i] & 0xFF) << 24
-             | (data[i + 1] & 0xFF) << 16
-             | (data[i + 2] & 0xFF) << 8
-             | (data[i + 3] & 0xFF);
-    }
-
-    private static long readLong(byte[] data, int i) {
-        if (PlatformDependent.isUnaligned()) {
-            long v = PlatformDependent.getLong(data, i);
-            return BIG_ENDIAN_NATIVE_ORDER ? v : Long.reverseBytes(v);
-        }
-        return (long) (data[i] & 0xFF) << 56
-             | (long) (data[i + 1] & 0xFF) << 48
-             | (long) (data[i + 2] & 0xFF) << 40
-             | (long) (data[i + 3] & 0xFF) << 32
-             | (long) (data[i + 4] & 0xFF) << 24
-             | (long) (data[i + 5] & 0xFF) << 16
-             | (long) (data[i + 6] & 0xFF) << 8
-             | (long) (data[i + 7] & 0xFF);
     }
 }
