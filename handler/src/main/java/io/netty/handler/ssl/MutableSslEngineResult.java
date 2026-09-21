@@ -43,17 +43,23 @@ final class MutableSslEngineResult {
      * Cached {@link SSLEngineResult}s for all combinations of {@link Status} and {@link HandshakeStatus} where
      * nothing was consumed and nothing was produced. These are very common (for example during the handshake) and
      * are shared to avoid allocations when converting to a {@link SSLEngineResult}.
+     * <p>
+     * Indexed by {@link #emptyResultIndex(Status, HandshakeStatus)}.
      */
-    private static final SSLEngineResult[][] EMPTY_RESULTS = new SSLEngineResult[STATUSES.length][];
+    private static final SSLEngineResult[] EMPTY_RESULTS =
+            new SSLEngineResult[STATUSES.length * HANDSHAKE_STATUSES.length];
 
     static {
         for (Status status : STATUSES) {
-            SSLEngineResult[] results = new SSLEngineResult[HANDSHAKE_STATUSES.length];
             for (HandshakeStatus handshakeStatus : HANDSHAKE_STATUSES) {
-                results[handshakeStatus.ordinal()] = new SSLEngineResult(status, handshakeStatus, 0, 0);
+                EMPTY_RESULTS[emptyResultIndex(status, handshakeStatus)] =
+                        new SSLEngineResult(status, handshakeStatus, 0, 0);
             }
-            EMPTY_RESULTS[status.ordinal()] = results;
         }
+    }
+
+    private static int emptyResultIndex(Status status, HandshakeStatus handshakeStatus) {
+        return status.ordinal() * HANDSHAKE_STATUSES.length + handshakeStatus.ordinal();
     }
 
     private Status status = Status.OK;
@@ -119,7 +125,7 @@ final class MutableSslEngineResult {
      */
     SSLEngineResult toSSLEngineResult() {
         if (bytesConsumed == 0 && bytesProduced == 0) {
-            return EMPTY_RESULTS[status.ordinal()][handshakeStatus.ordinal()];
+            return EMPTY_RESULTS[emptyResultIndex(status, handshakeStatus)];
         }
         return new SSLEngineResult(status, handshakeStatus, bytesConsumed, bytesProduced);
     }
