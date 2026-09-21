@@ -124,12 +124,6 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
      */
     static final int MAX_RECORD_SIZE = SSL.SSL_MAX_RECORD_LENGTH;
 
-    private static final SSLEngineResult NEED_UNWRAP_OK = new SSLEngineResult(OK, NEED_UNWRAP, 0, 0);
-    private static final SSLEngineResult NEED_UNWRAP_CLOSED = new SSLEngineResult(CLOSED, NEED_UNWRAP, 0, 0);
-    private static final SSLEngineResult NEED_WRAP_OK = new SSLEngineResult(OK, NEED_WRAP, 0, 0);
-    private static final SSLEngineResult NEED_WRAP_CLOSED = new SSLEngineResult(CLOSED, NEED_WRAP, 0, 0);
-    private static final SSLEngineResult CLOSED_NOT_HANDSHAKING = new SSLEngineResult(CLOSED, NOT_HANDSHAKING, 0, 0);
-
     // OpenSSL state
     private long ssl;
     private long networkBIO;
@@ -211,6 +205,13 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
     private final OpenSslInternalSession session;
     private final ByteBuffer[] singleSrcBuffer = new ByteBuffer[1];
     private final ByteBuffer[] singleDstBuffer = new ByteBuffer[1];
+    /**
+     * Holds the result of the last {@code wrap} / {@code unwrap} operation. Only accessed while holding the lock on
+     * {@code this}, so it can be shared between all operations of this engine. This allows to only allocate a
+     * {@link SSLEngineResult} for callers of the public {@link SSLEngine} API, while {@link SslHandler} can read the
+     * result without any allocation.
+     */
+    private final MutableSslEngineResult result = new MutableSslEngineResult();
     private final boolean enableOcsp;
     private int maxWrapOverhead;
     private int maxWrapBufferSize;
@@ -789,6 +790,26 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
     @Override
     public final SSLEngineResult wrap(
             final ByteBuffer[] srcs, int offset, final int length, final ByteBuffer dst) throws SSLException {
+        synchronized (this) {
+            return wrap0(srcs, offset, length, dst).toSSLEngineResult();
+        }
+    }
+
+    /**
+     * Same as {@link #wrap(ByteBuffer[], int, int, ByteBuffer)} but stores the result in the given
+     * {@link MutableSslEngineResult} instead of allocating a new {@link SSLEngineResult}.
+     * <p>
+     * This is used by {@link SslHandler} to avoid one allocation per TLS record.
+     */
+    final void wrap(ByteBuffer[] srcs, int offset, int length, ByteBuffer dst, MutableSslEngineResult out)
+            throws SSLException {
+        synchronized (this) {
+            out.set(wrap0(srcs, offset, length, dst));
+        }
+    }
+
+    private MutableSslEngineResult wrap0(
+            final ByteBuffer[] srcs, int offset, final int length, final ByteBuffer dst) throws SSLException {
         // Throw required runtime exceptions
         checkNotNullWithIAE(srcs, "srcs");
         checkNotNullWithIAE(dst, "dst");
@@ -806,7 +827,7 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
         synchronized (this) {
             if (isOutboundDone()) {
                 // All drained in the outbound buffer
-                return isInboundDone() || destroyed ? CLOSED_NOT_HANDSHAKING : NEED_UNWRAP_CLOSED;
+                return result.set(CLOSED, isInboundDone() || destroyed ? NOT_HANDSHAKING : NEED_UNWRAP, 0, 0);
             }
 
             int bytesProduced = 0;
@@ -832,7 +853,7 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
                     // We use a plaintextLength of 2 as we at least want to have an alert fit into it.
                     // https://tools.ietf.org/html/rfc5246#section-7.2
                     if (!isBytesAvailableEnoughForWrap(dst.remaining(), 2, 1)) {
-                        return new SSLEngineResult(BUFFER_OVERFLOW, getHandshakeStatus(), 0, 0);
+                        return result.set(BUFFER_OVERFLOW, getHandshakeStatus(), 0, 0);
                     }
 
                     // There is something left to drain.
@@ -908,7 +929,7 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
 
                     if (status == NEED_UNWRAP) {
                         // Signal if the outbound is done or not.
-                        return isOutboundDone() ? NEED_UNWRAP_CLOSED : NEED_UNWRAP_OK;
+                        return result.set(isOutboundDone() ? CLOSED : OK, NEED_UNWRAP, 0, 0);
                     }
 
                     // Explicit use outboundClosed and not outboundClosed() as we want to drain any bytes that are
@@ -947,7 +968,7 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
                     // jdkCompatibilityMode will only produce a single TLS packet, and we don't aggregate src buffers,
                     // so we always fix the number of buffers to 1 when checking if the dst buffer is large enough.
                     if (!isBytesAvailableEnoughForWrap(dst.remaining(), srcsLen, 1)) {
-                        return new SSLEngineResult(BUFFER_OVERFLOW, getHandshakeStatus(), 0, 0);
+                        return result.set(BUFFER_OVERFLOW, getHandshakeStatus(), 0, 0);
                     }
                 }
 
@@ -991,7 +1012,7 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
                         // between calls.
                         final int availableCapacityForWrap = dst.remaining() - bytesProduced - maxWrapOverhead;
                         if (availableCapacityForWrap <= 0) {
-                            return new SSLEngineResult(BUFFER_OVERFLOW, getHandshakeStatus(), bytesConsumed,
+                            return result.set(BUFFER_OVERFLOW, getHandshakeStatus(), bytesConsumed,
                                     bytesProduced);
                         }
                         bytesWritten = writePlaintextData(src, min(remaining, availableCapacityForWrap));
@@ -1082,12 +1103,13 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
         }
     }
 
-    private SSLEngineResult newResult(SSLEngineResult.HandshakeStatus hs, int bytesConsumed, int bytesProduced) {
+    private MutableSslEngineResult newResult(SSLEngineResult.HandshakeStatus hs,
+                                             int bytesConsumed, int bytesProduced) {
         return newResult(OK, hs, bytesConsumed, bytesProduced);
     }
 
-    private SSLEngineResult newResult(SSLEngineResult.Status status, SSLEngineResult.HandshakeStatus hs,
-                                      int bytesConsumed, int bytesProduced) {
+    private MutableSslEngineResult newResult(SSLEngineResult.Status status, SSLEngineResult.HandshakeStatus hs,
+                                             int bytesConsumed, int bytesProduced) {
         // If isOutboundDone, then the data from the network BIO
         // was the close_notify message and all was consumed we are not required to wait
         // for the receipt the peer's close_notify message -- shutdown.
@@ -1099,23 +1121,25 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
                 // As the inbound and the outbound is done we can shutdown the engine now.
                 shutdown();
             }
-            return new SSLEngineResult(CLOSED, hs, bytesConsumed, bytesProduced);
+            return result.set(CLOSED, hs, bytesConsumed, bytesProduced);
         }
         if (hs == NEED_TASK) {
             // Set needTask to true so getHandshakeStatus() will return the correct value.
             needTask = true;
         }
-        return new SSLEngineResult(status, hs, bytesConsumed, bytesProduced);
+        return result.set(status, hs, bytesConsumed, bytesProduced);
     }
 
-    private SSLEngineResult newResultMayFinishHandshake(SSLEngineResult.HandshakeStatus hs,
-                                                        int bytesConsumed, int bytesProduced) throws SSLException {
+    private MutableSslEngineResult newResultMayFinishHandshake(SSLEngineResult.HandshakeStatus hs,
+                                                               int bytesConsumed, int bytesProduced)
+            throws SSLException {
         return newResult(mayFinishHandshake(hs, bytesConsumed, bytesProduced), bytesConsumed, bytesProduced);
     }
 
-    private SSLEngineResult newResultMayFinishHandshake(SSLEngineResult.Status status,
-                                                        SSLEngineResult.HandshakeStatus hs,
-                                                        int bytesConsumed, int bytesProduced) throws SSLException {
+    private MutableSslEngineResult newResultMayFinishHandshake(SSLEngineResult.Status status,
+                                                               SSLEngineResult.HandshakeStatus hs,
+                                                               int bytesConsumed, int bytesProduced)
+            throws SSLException {
         return newResult(status, mayFinishHandshake(hs, bytesConsumed, bytesProduced), bytesConsumed, bytesProduced);
     }
 
@@ -1141,7 +1165,7 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
         return exception;
     }
 
-    private SSLEngineResult handleUnwrapException(int bytesConsumed, int bytesProduced, SSLException e)
+    private MutableSslEngineResult handleUnwrapException(int bytesConsumed, int bytesProduced, SSLException e)
             throws SSLException {
         int lastError = SSL.getLastErrorNumber();
         if (lastError != 0) {
@@ -1152,6 +1176,45 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
     }
 
     public final SSLEngineResult unwrap(
+            final ByteBuffer[] srcs, int srcsOffset, final int srcsLength,
+            final ByteBuffer[] dsts, int dstsOffset, final int dstsLength) throws SSLException {
+        synchronized (this) {
+            return unwrap0(srcs, srcsOffset, srcsLength, dsts, dstsOffset, dstsLength).toSSLEngineResult();
+        }
+    }
+
+    /**
+     * Same as {@link #unwrap(ByteBuffer[], int, int, ByteBuffer[], int, int)} but stores the result in the given
+     * {@link MutableSslEngineResult} instead of allocating a new {@link SSLEngineResult}.
+     * <p>
+     * This is used by {@link SslHandler} to avoid one allocation per {@code unwrap} call.
+     */
+    final void unwrap(ByteBuffer[] srcs, int srcsOffset, int srcsLength,
+                      ByteBuffer[] dsts, int dstsOffset, int dstsLength, MutableSslEngineResult out)
+            throws SSLException {
+        synchronized (this) {
+            out.set(unwrap0(srcs, srcsOffset, srcsLength, dsts, dstsOffset, dstsLength));
+        }
+    }
+
+    /**
+     * Same as {@link #unwrap(ByteBuffer, ByteBuffer)} but stores the result in the given
+     * {@link MutableSslEngineResult} instead of allocating a new {@link SSLEngineResult}.
+     * <p>
+     * This is used by {@link SslHandler} to avoid one allocation per {@code unwrap} call.
+     */
+    final void unwrap(ByteBuffer src, ByteBuffer dst, MutableSslEngineResult out) throws SSLException {
+        synchronized (this) {
+            try {
+                out.set(unwrap0(singleSrcBuffer(src), 0, 1, singleDstBuffer(dst), 0, 1));
+            } finally {
+                resetSingleSrcBuffer();
+                resetSingleDstBuffer();
+            }
+        }
+    }
+
+    private MutableSslEngineResult unwrap0(
             final ByteBuffer[] srcs, int srcsOffset, final int srcsLength,
             final ByteBuffer[] dsts, int dstsOffset, final int dstsLength) throws SSLException {
 
@@ -1188,7 +1251,7 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
 
         synchronized (this) {
             if (isInboundDone()) {
-                return isOutboundDone() || destroyed ? CLOSED_NOT_HANDSHAKING : NEED_WRAP_CLOSED;
+                return result.set(CLOSED, isOutboundDone() || destroyed ? NOT_HANDSHAKING : NEED_WRAP, 0, 0);
             }
 
             SSLEngineResult.HandshakeStatus status = NOT_HANDSHAKING;
@@ -1207,11 +1270,11 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
                 }
 
                 if (status == NEED_WRAP) {
-                    return NEED_WRAP_OK;
+                    return result.set(OK, NEED_WRAP, 0, 0);
                 }
                 // Check if the inbound is considered to be closed if so let us try to wrap again.
                 if (isInboundDone) {
-                    return NEED_WRAP_CLOSED;
+                    return result.set(CLOSED, NEED_WRAP, 0, 0);
                 }
             }
 
@@ -1437,12 +1500,12 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
         return true;
     }
 
-    private SSLEngineResult sslReadErrorResult(int error, int stackError, int bytesConsumed, int bytesProduced)
-            throws SSLException {
+    private MutableSslEngineResult sslReadErrorResult(int error, int stackError,
+                                                      int bytesConsumed, int bytesProduced) throws SSLException {
         if (needWrapAgain(stackError)) {
             // There is something that needs to be send to the remote peer before we can teardown.
             // This is most likely some alert.
-            return new SSLEngineResult(OK, NEED_WRAP, bytesConsumed, bytesProduced);
+            return result.set(OK, NEED_WRAP, bytesConsumed, bytesProduced);
         }
         throw shutdownWithError("SSL_read", error, stackError);
     }
