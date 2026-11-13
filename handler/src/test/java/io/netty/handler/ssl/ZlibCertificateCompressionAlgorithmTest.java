@@ -24,6 +24,7 @@ import java.util.zip.Deflater;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class ZlibCertificateCompressionAlgorithmTest {
@@ -42,6 +43,56 @@ class ZlibCertificateCompressionAlgorithmTest {
 
         assertArrayEquals(certificate, algorithm.decompress(null, certificate.length, compressed));
         assertEquals(1, algorithm.algorithmId());
+    }
+
+    @Test
+    void repeatedCompressionReturnsEqualIndependentArrays() throws Exception {
+        byte[] certificate = "certificate-chain-compressed-twice".getBytes(StandardCharsets.US_ASCII);
+
+        byte[] first = algorithm.compress(null, certificate);
+        byte[] expected = first.clone();
+        Arrays.fill(first, (byte) 0);
+        byte[] second = algorithm.compress(null, certificate.clone());
+
+        assertNotSame(first, second);
+        assertArrayEquals(expected, second);
+        assertArrayEquals(certificate, algorithm.decompress(null, certificate.length, second));
+    }
+
+    @Test
+    void laterChangesToTheInputDoNotAffectCachedResult() throws Exception {
+        byte[] certificate = "certificate-chain-modified-later".getBytes(StandardCharsets.US_ASCII);
+        byte[] original = certificate.clone();
+
+        algorithm.compress(null, certificate);
+        Arrays.fill(certificate, (byte) 'x');
+
+        assertArrayEquals(original, algorithm.decompress(null, original.length, algorithm.compress(null, original)));
+        assertArrayEquals(certificate,
+                algorithm.decompress(null, certificate.length, algorithm.compress(null, certificate)));
+    }
+
+    @Test
+    void manyDistinctCertificatesRoundTrip() throws Exception {
+        for (int round = 0; round < 2; round++) {
+            for (int i = 0; i < 200; i++) {
+                byte[] certificate = ("certificate-chain-" + i).getBytes(StandardCharsets.US_ASCII);
+                byte[] compressed = algorithm.compress(null, certificate);
+                assertArrayEquals(certificate, algorithm.decompress(null, certificate.length, compressed));
+            }
+        }
+    }
+
+    @Test
+    void certificateLargerThanCacheLimitRoundTrips() throws Exception {
+        byte[] certificate = new byte[64 * 1024];
+        for (int i = 0; i < certificate.length; i++) {
+            certificate[i] = (byte) (i * 31);
+        }
+
+        assertArrayEquals(algorithm.compress(null, certificate), algorithm.compress(null, certificate));
+        assertArrayEquals(certificate,
+                algorithm.decompress(null, certificate.length, algorithm.compress(null, certificate)));
     }
 
     @Test

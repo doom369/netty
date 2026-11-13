@@ -16,6 +16,9 @@
 package io.netty.handler.ssl;
 
 import java.io.ByteArrayOutputStream;
+import java.util.Arrays;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
 import java.util.zip.Inflater;
@@ -39,10 +42,33 @@ public final class ZlibCertificateCompressionAlgorithm implements OpenSslCertifi
     private static final int BUFFER_SIZE = 8192;
     private static final int MAX_UNCOMPRESSED_CERTIFICATE_LENGTH = 0xFFFFFF;
 
+    // The same certificate message is sent on every handshake that uses the same certificate chain, and deflating
+    // is deterministic, so the result is remembered. Both limits bound the memory the cache can retain: a handful of
+    // chains is the common case, while a server with many certificates simply starts over once the cache is full.
+    private static final int MAX_CACHED_CERTIFICATES = 64;
+    private static final int MAX_CACHED_CERTIFICATE_LENGTH = 32 * 1024;
+
+    private final ConcurrentMap<CertificateKey, byte[]> compressedCertificates = new ConcurrentHashMap<>();
+
     private ZlibCertificateCompressionAlgorithm() { }
 
     @Override
     public byte[] compress(SSLEngine engine, byte[] uncompressedCertificate) {
+        if (uncompressedCertificate.length > MAX_CACHED_CERTIFICATE_LENGTH) {
+            return deflate(uncompressedCertificate);
+        }
+        byte[] compressed = compressedCertificates.get(new CertificateKey(uncompressedCertificate));
+        if (compressed == null) {
+            compressed = deflate(uncompressedCertificate);
+            if (compressedCertificates.size() >= MAX_CACHED_CERTIFICATES) {
+                compressedCertificates.clear();
+            }
+            compressedCertificates.put(new CertificateKey(uncompressedCertificate.clone()), compressed);
+        }
+        return compressed.clone();
+    }
+
+    private static byte[] deflate(byte[] uncompressedCertificate) {
         Deflater deflater = new Deflater();
         try {
             deflater.setInput(uncompressedCertificate);
@@ -91,5 +117,25 @@ public final class ZlibCertificateCompressionAlgorithm implements OpenSslCertifi
     @Override
     public int algorithmId() {
         return ALGORITHM_ID;
+    }
+
+    private static final class CertificateKey {
+        private final byte[] certificate;
+        private final int hash;
+
+        CertificateKey(byte[] certificate) {
+            this.certificate = certificate;
+            hash = Arrays.hashCode(certificate);
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            return obj instanceof CertificateKey && Arrays.equals(certificate, ((CertificateKey) obj).certificate);
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
     }
 }
