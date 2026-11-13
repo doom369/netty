@@ -26,6 +26,8 @@ import org.openjdk.jmh.annotations.Param;
 import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
+import org.openjdk.jmh.profile.GCProfiler;
+import org.openjdk.jmh.runner.options.ChainedOptionsBuilder;
 
 import java.util.concurrent.TimeUnit;
 
@@ -52,6 +54,11 @@ public class ZlibCertificateCompressionBenchmark extends AbstractMicrobenchmark 
         } finally {
             selfSigned.delete();
         }
+    }
+
+    @Override
+    protected ChainedOptionsBuilder newOptionsBuilder() throws Exception {
+        return super.newOptionsBuilder().addProfiler(GCProfiler.class);
     }
 
     @Benchmark
