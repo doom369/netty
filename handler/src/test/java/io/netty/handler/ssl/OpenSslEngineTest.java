@@ -33,6 +33,7 @@ import io.netty.util.ReferenceCountUtil;
 import io.netty.util.test.LeakPresenceExtension;
 import io.netty.util.internal.EmptyArrays;
 import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.ResourcesUtil;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -246,6 +247,44 @@ public class OpenSslEngineTest extends SSLEngineTest {
             }
         }
         return true;
+    }
+
+    @Test
+    public void testAuthMethodsFollowTheCipherSuitesOfTheEngine() throws Exception {
+        File serverKeyFile = ResourcesUtil.getFile(getClass(), "test_unencrypted.pem");
+        File serverCrtFile = ResourcesUtil.getFile(getClass(), "test.crt");
+        SslContext context = SslContextBuilder.forServer(serverCrtFile, serverKeyFile)
+                .sslProvider(sslServerProvider())
+                .build();
+        String[] singleCipherSuite = { "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" };
+        ReferenceCountedOpenSslEngine changed = null;
+        ReferenceCountedOpenSslEngine first = null;
+        ReferenceCountedOpenSslEngine second = null;
+        try {
+            changed = (ReferenceCountedOpenSslEngine) context.newEngine(UnpooledByteBufAllocator.DEFAULT);
+            first = (ReferenceCountedOpenSslEngine) context.newEngine(UnpooledByteBufAllocator.DEFAULT);
+            second = (ReferenceCountedOpenSslEngine) context.newEngine(UnpooledByteBufAllocator.DEFAULT);
+
+            // Ask the engine with its own cipher suites first, so a wrongly shared result would be noticed below.
+            changed.setEnabledCipherSuites(singleCipherSuite);
+            String[] changedMethods = changed.authMethods();
+            assertThat(changedMethods).contains("ECDHE_ECDSA").doesNotContain("ECDHE_RSA");
+
+            String[] contextMethods = first.authMethods();
+            assertThat(contextMethods).contains("ECDHE_RSA");
+            assertThat(contextMethods.length).isGreaterThan(changedMethods.length);
+            assertArrayEquals(contextMethods, second.authMethods());
+            assertArrayEquals(changedMethods, changed.authMethods());
+
+            second.setEnabledCipherSuites(singleCipherSuite);
+            assertArrayEquals(changedMethods, second.authMethods());
+            assertArrayEquals(contextMethods, first.authMethods());
+        } finally {
+            ReferenceCountUtil.release(changed);
+            ReferenceCountUtil.release(first);
+            ReferenceCountUtil.release(second);
+            ReferenceCountUtil.release(context);
+        }
     }
 
     @MethodSource("newTestParams")
