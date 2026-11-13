@@ -268,8 +268,10 @@ public class OpenSslEngineTest extends SSLEngineTest {
             // Ask the engine with its own cipher suites first, so a wrongly shared result would be noticed below.
             changed.setEnabledCipherSuites(singleCipherSuite);
             String[] changedMethods = changed.authMethods();
-            assertThat(changedMethods).contains("ECDHE_ECDSA").doesNotContain("ECDHE_RSA");
+            assertThat(changedMethods).contains("ECDHE_ECDSA");
 
+            // Only the number of methods is compared, as OpenSSL also reports its TLSv1.3 cipher suites here and
+            // does so as ECDHE_RSA, while BoringSSL leaves them out.
             String[] contextMethods = first.authMethods();
             assertThat(contextMethods).contains("ECDHE_RSA");
             assertThat(contextMethods.length).isGreaterThan(changedMethods.length);
