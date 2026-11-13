@@ -16,6 +16,8 @@
 package io.netty.handler.ssl;
 
 import java.util.Locale;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -47,6 +49,11 @@ final class SignatureAlgorithmConverter {
             // group 5 - 6
             "(?:(^[a-zA-Z].+)_(.+$))");
 
+    // The names come from the fixed tables of the native library, so only a handful of distinct values are ever
+    // seen. The limit only guards against unbounded growth should that assumption not hold.
+    private static final int MAX_CACHED_NAMES = 64;
+    private static final ConcurrentMap<String, String> JAVA_NAMES = new ConcurrentHashMap<>();
+
     /**
      * Converts an OpenSSL algorithm name to a Java algorithm name and return it,
      * or return {@code null} if the conversion failed because the format is not known.
@@ -55,6 +62,17 @@ final class SignatureAlgorithmConverter {
         if (opensslName == null) {
             return null;
         }
+        String javaName = JAVA_NAMES.get(opensslName);
+        if (javaName == null) {
+            javaName = convert(opensslName);
+            if (javaName != null && JAVA_NAMES.size() < MAX_CACHED_NAMES) {
+                JAVA_NAMES.put(opensslName, javaName);
+            }
+        }
+        return javaName;
+    }
+
+    private static String convert(String opensslName) {
         // EdDSA names carry no hash, so the pattern can't match them
         if ("ed25519".equalsIgnoreCase(opensslName)) {
             return "Ed25519";

@@ -63,6 +63,21 @@ public class SignatureAlgorithmConverterTest {
     }
 
     @Test
+    public void testRepeatedConversionReturnsSameName() {
+        assertEquals("SHA384withRSA", SignatureAlgorithmConverter.toJavaName("rsa_pss_rsae_sha384"));
+        assertEquals("SHA384withRSA", SignatureAlgorithmConverter.toJavaName("rsa_pss_rsae_sha384"));
+        assertEquals("SHA384withECDSA", SignatureAlgorithmConverter.toJavaName("ecdsa_sha384"));
+    }
+
+    @Test
+    public void testManyDistinctNames() {
+        for (int i = 0; i < 1000; i++) {
+            assertEquals("SHA" + i + "withRSA", SignatureAlgorithmConverter.toJavaName("rsa_pkcs1_sha" + i));
+        }
+        assertEquals("SHA256withRSA", SignatureAlgorithmConverter.toJavaName("rsa_pkcs1_sha256"));
+    }
+
+    @Test
     public void testInvalid() {
         assertNull(SignatureAlgorithmConverter.toJavaName("ThisIsSomethingInvalid"));
     }
