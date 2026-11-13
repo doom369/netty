@@ -61,7 +61,8 @@ public class ZlibCertificateCompressionBenchmark extends AbstractMicrobenchmark 
             } finally {
                 selfSigned.delete();
             }
-            ZlibCertificateCompressionAlgorithm.INSTANCE.compress(null, certificate);
+            // The native caller passes a new array on every handshake, never the one that is cached.
+            ZlibCertificateCompressionAlgorithm.INSTANCE.compress(null, certificate.clone());
         }
     }
 

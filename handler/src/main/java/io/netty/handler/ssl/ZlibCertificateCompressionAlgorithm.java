@@ -17,6 +17,7 @@ package io.netty.handler.ssl;
 
 import java.io.ByteArrayOutputStream;
 import java.util.Arrays;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
 import java.util.zip.Inflater;
@@ -42,50 +43,39 @@ public final class ZlibCertificateCompressionAlgorithm implements OpenSslCertifi
 
     // The same certificate message is sent on every handshake that uses the same certificate chain, and deflating
     // is deterministic, so the result is remembered. Only the certificates of this side are ever compressed, so a
-    // handful of entries is the common case and a linear scan over an immutable array is cheaper than hashing the
-    // whole message. Both limits bound the memory the cache can retain: once it is full the oldest entry is replaced.
+    // handful of entries is the common case and a linear scan is cheaper than hashing the whole message. Both limits
+    // bound the memory the cache can retain: once it is full the oldest entry is dropped.
+    //
+    // Neither the message nor the result is copied. The native caller hands over a new array on every call and
+    // copies the result out of the returned one, so nothing modifies the arrays the cache holds.
     private static final int MAX_CACHED_CERTIFICATES = 16;
     private static final int MAX_CACHED_CERTIFICATE_LENGTH = 32 * 1024;
 
-    // Copy-on-write: the array is never modified after it was published.
-    private volatile CachedCertificate[] cache = new CachedCertificate[0];
-    // Guarded by synchronized (this).
-    private int nextReplaced;
+    private final CopyOnWriteArrayList<CachedCertificate> cache = new CopyOnWriteArrayList<CachedCertificate>();
 
     private ZlibCertificateCompressionAlgorithm() { }
 
+    /**
+     * {@inheritDoc}
+     * <p>
+     * The result is remembered and returned again for an equal {@code uncompressedCertificate}, so neither the given
+     * array nor the returned one may be modified after the call.
+     */
     @Override
     public byte[] compress(SSLEngine engine, byte[] uncompressedCertificate) {
         for (CachedCertificate cached : cache) {
             if (Arrays.equals(cached.uncompressed, uncompressedCertificate)) {
-                return cached.compressed.clone();
+                return cached.compressed;
             }
         }
         byte[] compressed = deflate(uncompressedCertificate);
         if (uncompressedCertificate.length <= MAX_CACHED_CERTIFICATE_LENGTH) {
-            add(new CachedCertificate(uncompressedCertificate.clone(), compressed.clone()));
+            if (cache.size() >= MAX_CACHED_CERTIFICATES) {
+                cache.remove(0);
+            }
+            cache.addIfAbsent(new CachedCertificate(uncompressedCertificate, compressed));
         }
         return compressed;
-    }
-
-    private synchronized void add(CachedCertificate certificate) {
-        CachedCertificate[] current = cache;
-        for (CachedCertificate cached : current) {
-            if (Arrays.equals(cached.uncompressed, certificate.uncompressed)) {
-                // Another thread compressed the same certificate concurrently.
-                return;
-            }
-        }
-        CachedCertificate[] updated;
-        if (current.length < MAX_CACHED_CERTIFICATES) {
-            updated = Arrays.copyOf(current, current.length + 1);
-            updated[current.length] = certificate;
-        } else {
-            updated = current.clone();
-            updated[nextReplaced] = certificate;
-            nextReplaced = (nextReplaced + 1) % MAX_CACHED_CERTIFICATES;
-        }
-        cache = updated;
     }
 
     private static byte[] deflate(byte[] uncompressedCertificate) {
@@ -146,6 +136,17 @@ public final class ZlibCertificateCompressionAlgorithm implements OpenSslCertifi
         CachedCertificate(byte[] uncompressed, byte[] compressed) {
             this.uncompressed = uncompressed;
             this.compressed = compressed;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            return obj instanceof CachedCertificate &&
+                    Arrays.equals(uncompressed, ((CachedCertificate) obj).uncompressed);
+        }
+
+        @Override
+        public int hashCode() {
+            return Arrays.hashCode(uncompressed);
         }
     }
 }
