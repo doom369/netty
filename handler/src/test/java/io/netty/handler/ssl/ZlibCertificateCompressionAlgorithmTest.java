@@ -18,7 +18,14 @@ package io.netty.handler.ssl;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
 
@@ -80,6 +87,40 @@ class ZlibCertificateCompressionAlgorithmTest {
                 byte[] compressed = algorithm.compress(null, certificate);
                 assertArrayEquals(certificate, algorithm.decompress(null, certificate.length, compressed));
             }
+        }
+    }
+
+    @Test
+    void concurrentCompressionOfMoreCertificatesThanCachedRoundTrips() throws Exception {
+        final int threads = 8;
+        final int certificates = 40;
+        final CyclicBarrier start = new CyclicBarrier(threads);
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        try {
+            List<Future<Void>> results = new ArrayList<Future<Void>>();
+            for (int t = 0; t < threads; t++) {
+                final int offset = t;
+                results.add(executor.submit(new Callable<Void>() {
+                    @Override
+                    public Void call() throws Exception {
+                        start.await();
+                        for (int i = 0; i < 2000; i++) {
+                            byte[] certificate = ("concurrent-certificate-chain-" + (i + offset) % certificates)
+                                    .getBytes(StandardCharsets.US_ASCII);
+                            byte[] compressed = algorithm.compress(null, certificate);
+                            assertArrayEquals(certificate,
+                                    algorithm.decompress(null, certificate.length, compressed));
+                            Arrays.fill(compressed, (byte) 0);
+                        }
+                        return null;
+                    }
+                }));
+            }
+            for (Future<Void> result : results) {
+                result.get();
+            }
+        } finally {
+            executor.shutdownNow();
         }
     }
 

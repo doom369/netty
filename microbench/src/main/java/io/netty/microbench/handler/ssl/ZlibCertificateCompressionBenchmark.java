@@ -33,7 +33,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Measures compressing the same certificate over and over, as a server does on every TLS 1.3 handshake with a
- * client that negotiated certificate compression.
+ * client that negotiated certificate compression, alone and with other certificates in use as well.
  */
 @State(Scope.Benchmark)
 @BenchmarkMode(Mode.AverageTime)
@@ -43,16 +43,25 @@ public class ZlibCertificateCompressionBenchmark extends AbstractMicrobenchmark 
     @Param({ "RSA", "EC" })
     public String algorithm;
 
+    /**
+     * How many distinct certificates were compressed before the measurement starts, the measured one being the last.
+     */
+    @Param({ "1", "16" })
+    public int certificates;
+
     private byte[] certificate;
 
     @Setup
     public void setup() throws Exception {
-        SelfSignedCertificate selfSigned = new SelfSignedCertificate("localhost", algorithm,
-                "RSA".equals(algorithm) ? 2048 : 256);
-        try {
-            certificate = selfSigned.cert().getEncoded();
-        } finally {
-            selfSigned.delete();
+        for (int i = 0; i < certificates; i++) {
+            SelfSignedCertificate selfSigned = new SelfSignedCertificate("localhost", algorithm,
+                    "RSA".equals(algorithm) ? 2048 : 256);
+            try {
+                certificate = selfSigned.cert().getEncoded();
+            } finally {
+                selfSigned.delete();
+            }
+            ZlibCertificateCompressionAlgorithm.INSTANCE.compress(null, certificate);
         }
     }
 

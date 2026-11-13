@@ -17,8 +17,6 @@ package io.netty.handler.ssl;
 
 import java.io.ByteArrayOutputStream;
 import java.util.Arrays;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
 import java.util.zip.Inflater;
@@ -43,29 +41,51 @@ public final class ZlibCertificateCompressionAlgorithm implements OpenSslCertifi
     private static final int MAX_UNCOMPRESSED_CERTIFICATE_LENGTH = 0xFFFFFF;
 
     // The same certificate message is sent on every handshake that uses the same certificate chain, and deflating
-    // is deterministic, so the result is remembered. Both limits bound the memory the cache can retain: a handful of
-    // chains is the common case, while a server with many certificates simply starts over once the cache is full.
-    private static final int MAX_CACHED_CERTIFICATES = 64;
+    // is deterministic, so the result is remembered. Only the certificates of this side are ever compressed, so a
+    // handful of entries is the common case and a linear scan over an immutable array is cheaper than hashing the
+    // whole message. Both limits bound the memory the cache can retain: once it is full the oldest entry is replaced.
+    private static final int MAX_CACHED_CERTIFICATES = 16;
     private static final int MAX_CACHED_CERTIFICATE_LENGTH = 32 * 1024;
 
-    private final ConcurrentMap<CertificateKey, byte[]> compressedCertificates = new ConcurrentHashMap<>();
+    // Copy-on-write: the array is never modified after it was published.
+    private volatile CachedCertificate[] cache = new CachedCertificate[0];
+    // Guarded by synchronized (this).
+    private int nextReplaced;
 
     private ZlibCertificateCompressionAlgorithm() { }
 
     @Override
     public byte[] compress(SSLEngine engine, byte[] uncompressedCertificate) {
-        if (uncompressedCertificate.length > MAX_CACHED_CERTIFICATE_LENGTH) {
-            return deflate(uncompressedCertificate);
-        }
-        byte[] compressed = compressedCertificates.get(new CertificateKey(uncompressedCertificate));
-        if (compressed == null) {
-            compressed = deflate(uncompressedCertificate);
-            if (compressedCertificates.size() >= MAX_CACHED_CERTIFICATES) {
-                compressedCertificates.clear();
+        for (CachedCertificate cached : cache) {
+            if (Arrays.equals(cached.uncompressed, uncompressedCertificate)) {
+                return cached.compressed.clone();
             }
-            compressedCertificates.put(new CertificateKey(uncompressedCertificate.clone()), compressed);
         }
-        return compressed.clone();
+        byte[] compressed = deflate(uncompressedCertificate);
+        if (uncompressedCertificate.length <= MAX_CACHED_CERTIFICATE_LENGTH) {
+            add(new CachedCertificate(uncompressedCertificate.clone(), compressed.clone()));
+        }
+        return compressed;
+    }
+
+    private synchronized void add(CachedCertificate certificate) {
+        CachedCertificate[] current = cache;
+        for (CachedCertificate cached : current) {
+            if (Arrays.equals(cached.uncompressed, certificate.uncompressed)) {
+                // Another thread compressed the same certificate concurrently.
+                return;
+            }
+        }
+        CachedCertificate[] updated;
+        if (current.length < MAX_CACHED_CERTIFICATES) {
+            updated = Arrays.copyOf(current, current.length + 1);
+            updated[current.length] = certificate;
+        } else {
+            updated = current.clone();
+            updated[nextReplaced] = certificate;
+            nextReplaced = (nextReplaced + 1) % MAX_CACHED_CERTIFICATES;
+        }
+        cache = updated;
     }
 
     private static byte[] deflate(byte[] uncompressedCertificate) {
@@ -119,23 +139,13 @@ public final class ZlibCertificateCompressionAlgorithm implements OpenSslCertifi
         return ALGORITHM_ID;
     }
 
-    private static final class CertificateKey {
-        private final byte[] certificate;
-        private final int hash;
+    private static final class CachedCertificate {
+        final byte[] uncompressed;
+        final byte[] compressed;
 
-        CertificateKey(byte[] certificate) {
-            this.certificate = certificate;
-            hash = Arrays.hashCode(certificate);
-        }
-
-        @Override
-        public boolean equals(Object obj) {
-            return obj instanceof CertificateKey && Arrays.equals(certificate, ((CertificateKey) obj).certificate);
-        }
-
-        @Override
-        public int hashCode() {
-            return hash;
+        CachedCertificate(byte[] uncompressed, byte[] compressed) {
+            this.uncompressed = uncompressed;
+            this.compressed = compressed;
         }
     }
 }
