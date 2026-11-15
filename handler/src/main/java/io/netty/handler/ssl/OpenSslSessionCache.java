@@ -31,7 +31,6 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * {@link SSLSessionCache} implementation for our native SSL implementation.
@@ -58,7 +57,7 @@ class OpenSslSessionCache implements SSLSessionCache {
 
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<OpenSslSessionId, NativeSslSession> eldest) {
-                    int maxSize = maximumCacheSize.get();
+                    int maxSize = maximumCacheSize;
                     if (maxSize >= 0 && size() > maxSize) {
                         removeSessionWithId(eldest.getKey());
                     }
@@ -67,19 +66,20 @@ class OpenSslSessionCache implements SSLSessionCache {
                 }
             };
 
-    private final AtomicInteger maximumCacheSize = new AtomicInteger(DEFAULT_CACHE_SIZE);
+    private volatile int maximumCacheSize = DEFAULT_CACHE_SIZE;
 
     // Let's use the same default value as OpenSSL does.
     // See https://www.openssl.org/docs/man1.1.1/man3/SSL_get_default_timeout.html
-    private final AtomicInteger sessionTimeout = new AtomicInteger(300);
+    private volatile int sessionTimeout = 300;
     private int sessionCounter;
 
     OpenSslSessionCache(OpenSslEngineMap engines) {
         this.engines = engines;
     }
 
-    final void setSessionTimeout(int seconds) {
-        int oldTimeout = sessionTimeout.getAndSet(seconds);
+    final synchronized void setSessionTimeout(int seconds) {
+        int oldTimeout = sessionTimeout;
+        sessionTimeout = seconds;
         if (oldTimeout > seconds) {
             // Drain the whole cache as this way we can use the ordering of the LinkedHashMap to detect early
             // if there are any other sessions left that are invalid.
@@ -88,7 +88,7 @@ class OpenSslSessionCache implements SSLSessionCache {
     }
 
     final int getSessionTimeout() {
-        return sessionTimeout.get();
+        return sessionTimeout;
     }
 
     /**
@@ -108,8 +108,9 @@ class OpenSslSessionCache implements SSLSessionCache {
      */
     protected void sessionRemoved(NativeSslSession session) { }
 
-    final void setSessionCacheSize(int size) {
-        long oldSize = maximumCacheSize.getAndSet(size);
+    final synchronized void setSessionCacheSize(int size) {
+        int oldSize = maximumCacheSize;
+        maximumCacheSize = size;
         if (oldSize > size || size == 0) {
             // Just keep it simple for now and drain the whole cache.
             clear();
@@ -117,7 +118,7 @@ class OpenSslSessionCache implements SSLSessionCache {
     }
 
     final int getSessionCacheSize() {
-        return maximumCacheSize.get();
+        return maximumCacheSize;
     }
 
     private void expungeInvalidSessions() {
