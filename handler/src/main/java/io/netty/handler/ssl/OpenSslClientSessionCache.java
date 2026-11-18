@@ -36,8 +36,7 @@ final class OpenSslClientSessionCache extends OpenSslSessionCache {
     }
 
     @Override
-    protected boolean sessionCreated(NativeSslSession session) {
-        assert Thread.holdsLock(this);
+    protected synchronized boolean sessionCreated(NativeSslSession session) {
         HostPort hostPort = keyFor(session.getPeerHost(), session.getPeerPort());
         if (hostPort == null) {
             return false;
@@ -54,8 +53,7 @@ final class OpenSslClientSessionCache extends OpenSslSessionCache {
     }
 
     @Override
-    protected void sessionRemoved(NativeSslSession session) {
-        assert Thread.holdsLock(this);
+    protected synchronized void sessionRemoved(NativeSslSession session) {
         HostPort hostPort = keyFor(session.getPeerHost(), session.getPeerPort());
         if (hostPort == null) {
             return;
