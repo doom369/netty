@@ -19,7 +19,6 @@ import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.UnpooledByteBufAllocator;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
-import io.netty.internal.tcnative.SSLContext;
 import io.netty.util.ReferenceCountUtil;
 import org.openjdk.jmh.annotations.AuxCounters;
 import org.openjdk.jmh.annotations.Benchmark;
@@ -62,16 +61,12 @@ public class OpenSslSessionCacheStormBenchmark {
     private static final ByteBuffer EMPTY = ByteBuffer.allocate(0);
     private static final int CLIENTS_PER_THREAD = 1024;
 
-    @Param({ "LOCKED", "STRIPED_LOCK", "CHM_QUEUE", "CHM_RING", "ASSOC_TABLE" })
-    public String impl;
-
     @Param({ "FULL", "RESUME" })
     public String mode;
 
     private final ByteBufAllocator allocator = UnpooledByteBufAllocator.DEFAULT;
     private SelfSignedCertificate cert;
     private SslContext serverContext;
-    private OpenSslSessionCache cache;
 
     @Setup(Level.Trial)
     public void setup() throws Exception {
@@ -80,14 +75,10 @@ public class OpenSslSessionCacheStormBenchmark {
                 .sslProvider(SslProvider.OPENSSL_REFCNT)
                 .protocols("TLSv1.2")
                 .build();
-        ReferenceCountedOpenSslContext context = (ReferenceCountedOpenSslContext) serverContext;
-        cache = SessionCacheCandidates.create(impl, context.engines);
-        SSLContext.setSSLSessionCache(context.ctx, cache);
     }
 
     @TearDown(Level.Trial)
     public void tearDown() {
-        cache.clear();
         ReferenceCountUtil.release(serverContext);
         cert.delete();
     }

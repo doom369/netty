@@ -30,7 +30,6 @@ import org.openjdk.jmh.annotations.Level;
 import org.openjdk.jmh.annotations.Measurement;
 import org.openjdk.jmh.annotations.Mode;
 import org.openjdk.jmh.annotations.OutputTimeUnit;
-import org.openjdk.jmh.annotations.Param;
 import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
@@ -60,9 +59,6 @@ public class OpenSslSessionCacheBenchmark {
     private static final int POOL = 32768;
     private static final int CACHE_SIZE = 20480;
     private static final int PREFILL = 16384;
-
-    @Param({ "LOCKED", "STRIPED_LOCK", "CHM_QUEUE", "CHM_RING", "ASSOC_TABLE" })
-    public String impl;
 
     private final ByteBufAllocator allocator = UnpooledByteBufAllocator.DEFAULT;
     private SelfSignedCertificate cert;
@@ -114,23 +110,14 @@ public class OpenSslSessionCacheBenchmark {
             ReferenceCountUtil.release(serverEngine);
         }
 
-        cache = SessionCacheCandidates.create(impl, context.engines);
+        cache = new OpenSslSessionCache(context.engines);
         cache.setSessionCacheSize(CACHE_SIZE);
         ReferenceCountedOpenSslEngine engine = (ReferenceCountedOpenSslEngine) serverContext.newEngine(allocator);
         for (int i = 0; i < PREFILL; i++) {
             SSLSession.upRef(sessions[i]);
             cache.sessionCreated(engine.sslPointer(), sessions[i]);
         }
-        int hits = 0;
-        for (int i = 0; i < PREFILL; i++) {
-            long session = cache.getSession(engine.sslPointer(), ids[i]);
-            if (session != -1) {
-                hits++;
-                SSLSession.free(session);
-            }
-        }
         ReferenceCountUtil.release(engine);
-        System.out.println("prefilled " + PREFILL + ", retained " + hits);
     }
 
     @TearDown(Level.Trial)
