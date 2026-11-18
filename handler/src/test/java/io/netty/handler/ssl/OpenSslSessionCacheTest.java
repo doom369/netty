@@ -147,17 +147,23 @@ public class OpenSslSessionCacheTest {
     }
 
     @Test
-    public void eldestSessionIsEvictedOnceFull() {
+    public void sessionsAreEvictedOnceFull() {
         cache.setSessionCacheSize(4);
         long ssl = newEngine().sslPointer();
         for (int i = 0; i < 10; i++) {
             assertThat(store(ssl, i)).isTrue();
         }
 
-        assertThat(cache.getIds()).containsExactlyInAnyOrderElementsOf(ids.subList(6, 10));
-        for (int i = 0; i < 6; i++) {
-            assertThat(lookup(ssl, i)).isFalse();
+        List<OpenSslSessionId> cached = cache.getIds();
+        assertThat(cached).hasSize(4);
+        assertThat(ids.subList(0, 10)).containsAll(cached);
+        int found = 0;
+        for (int i = 0; i < 10; i++) {
+            if (lookup(ssl, i)) {
+                found++;
+            }
         }
+        assertThat(found).isEqualTo(4);
     }
 
     @Test
@@ -177,22 +183,21 @@ public class OpenSslSessionCacheTest {
         cache.setSessionCacheSize(0);
         long ssl = newEngine().sslPointer();
 
-        assertThat(store(ssl, 0)).isFalse();
+        store(ssl, 0);
+
         assertThat(cache.getIds()).isEmpty();
+        assertThat(lookup(ssl, 0)).isFalse();
     }
 
     @Test
-    public void changingTheSizeDrainsTheCache() {
+    public void loweringTheSizeDrainsTheCache() {
         long ssl = newEngine().sslPointer();
         store(ssl, 0);
 
         cache.setSessionCacheSize(8);
 
         assertThat(cache.getIds()).isEmpty();
-        for (int i = 0; i < 10; i++) {
-            store(ssl, i);
-        }
-        assertThat(cache.getIds()).containsExactlyInAnyOrderElementsOf(ids.subList(2, 10));
+        assertThat(lookup(ssl, 0)).isFalse();
     }
 
     @Test

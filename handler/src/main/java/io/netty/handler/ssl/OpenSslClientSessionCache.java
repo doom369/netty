@@ -18,83 +18,53 @@ package io.netty.handler.ssl;
 import io.netty.internal.tcnative.SSL;
 import io.netty.util.AsciiString;
 
-import java.util.Arrays;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * {@link OpenSslSessionCache} that is used by the client-side.
  */
 final class OpenSslClientSessionCache extends OpenSslSessionCache {
-    // The arrays are never modified, a new one is created whenever a session is added or removed. This allows to
-    // go through the sessions of a host without any synchronization. Usually the server does not provide too many
-    // sessions per hostPort mapping, so these stay small.
-    private final ConcurrentMap<HostPort, NativeSslSession[]> sessions =
-            new ConcurrentHashMap<HostPort, NativeSslSession[]>();
+    private final Map<HostPort, Set<NativeSslSession>> sessions = new HashMap<>();
 
     OpenSslClientSessionCache(OpenSslEngineMap engines) {
         super(engines);
     }
 
     @Override
-    protected boolean sessionCreated(NativeSslSession session) {
+    protected synchronized boolean sessionCreated(NativeSslSession session) {
         HostPort hostPort = keyFor(session.getPeerHost(), session.getPeerPort());
         if (hostPort == null) {
             return false;
         }
-        for (;;) {
-            NativeSslSession[] sessionsForHost = sessions.get(hostPort);
-            if (sessionsForHost == null) {
-                if (sessions.putIfAbsent(hostPort, new NativeSslSession[] { session }) == null) {
-                    return true;
-                }
-            } else {
-                NativeSslSession[] added = Arrays.copyOf(sessionsForHost, sessionsForHost.length + 1);
-                added[sessionsForHost.length] = session;
-                if (sessions.replace(hostPort, sessionsForHost, added)) {
-                    return true;
-                }
-            }
+        Set<NativeSslSession> sessionsForHost = sessions.get(hostPort);
+        if (sessionsForHost == null) {
+            // Let's start with something small as usually the server does not provide too many of these per hostPort
+            // mapping.
+            sessionsForHost = new HashSet<>(4);
+            sessions.put(hostPort, sessionsForHost);
         }
+        sessionsForHost.add(session);
+        return true;
     }
 
     @Override
-    protected void sessionRemoved(NativeSslSession session) {
+    protected synchronized void sessionRemoved(NativeSslSession session) {
         HostPort hostPort = keyFor(session.getPeerHost(), session.getPeerPort());
         if (hostPort == null) {
             return;
         }
-        for (;;) {
-            NativeSslSession[] sessionsForHost = sessions.get(hostPort);
-            if (sessionsForHost == null) {
-                return;
-            }
-            int idx = indexOf(sessionsForHost, session);
-            if (idx < 0) {
-                return;
-            }
-            if (sessionsForHost.length == 1) {
-                if (sessions.remove(hostPort, sessionsForHost)) {
-                    return;
-                }
-            } else {
-                NativeSslSession[] removed = new NativeSslSession[sessionsForHost.length - 1];
-                System.arraycopy(sessionsForHost, 0, removed, 0, idx);
-                System.arraycopy(sessionsForHost, idx + 1, removed, idx, removed.length - idx);
-                if (sessions.replace(hostPort, sessionsForHost, removed)) {
-                    return;
-                }
+        Set<NativeSslSession> sessionsForHost = sessions.get(hostPort);
+        if (sessionsForHost != null) {
+            sessionsForHost.remove(session);
+            if (sessionsForHost.isEmpty()) {
+                sessions.remove(hostPort);
             }
         }
-    }
-
-    private static int indexOf(NativeSslSession[] sessions, NativeSslSession session) {
-        for (int i = 0; i < sessions.length; i++) {
-            if (sessions[i] == session) {
-                return i;
-            }
-        }
-        return -1;
     }
 
     @Override
@@ -103,51 +73,64 @@ final class OpenSslClientSessionCache extends OpenSslSessionCache {
         if (hostPort == null) {
             return false;
         }
-        NativeSslSession[] sessionsForHost = sessions.get(hostPort);
-        if (sessionsForHost == null) {
-            // There is no session that we can use.
-            return false;
-        }
+        NativeSslSession nativeSslSession = null;
+        final boolean reused;
+        boolean singleUsed = false;
+        synchronized (this) {
+            Set<NativeSslSession> sessionsForHost = sessions.get(hostPort);
+            if (sessionsForHost == null) {
+                return false;
+            }
+            if (sessionsForHost.isEmpty()) {
+                sessions.remove(hostPort);
+                // There is no session that we can use.
+                return false;
+            }
 
-        // Loop through all the sessions that might be usable and check if we can use one of these.
-        for (NativeSslSession nativeSslSession : sessionsForHost) {
-            if (!nativeSslSession.isValid()) {
-                // Remove everything that is not valid anymore
-                remove(nativeSslSession);
-                continue;
-            }
-            // Pin the session so the underlying SSL_SESSION* can not be freed while we hand it over.
-            if (!nativeSslSession.acquire()) {
-                // The session was removed from the cache in the meantime.
-                continue;
-            }
-            final boolean reused;
-            boolean singleUsed = false;
-            try {
-                // Try to set the session, if true is returned OpenSSL incremented the reference count
-                // of the underlying SSL_SESSION*.
-                reused = SSL.setSession(ssl, nativeSslSession.session());
-                if (reused) {
-                    singleUsed = nativeSslSession.shouldBeSingleUse();
+            List<NativeSslSession> toBeRemoved = null;
+            // Loop through all the sessions that might be usable and check if we can use one of these.
+            for (NativeSslSession sslSession : sessionsForHost) {
+                if (sslSession.isValid()) {
+                    nativeSslSession = sslSession;
+                    break;
+                } else {
+                    if (toBeRemoved == null) {
+                        toBeRemoved = new ArrayList<>(2);
+                    }
+                    toBeRemoved.add(sslSession);
                 }
-            } finally {
-                nativeSslSession.release();
             }
 
+            // Remove everything that is not valid anymore
+            if (toBeRemoved != null) {
+                for (NativeSslSession sslSession : toBeRemoved) {
+                    removeSessionWithId(sslSession.sessionId());
+                }
+            }
+            if (nativeSslSession == null) {
+                // Couldn't find a valid session that could be used.
+                return false;
+            }
+
+            // Try to set the session, if true is returned OpenSSL incremented the reference count
+            // of the underlying SSL_SESSION*.
+            reused = SSL.setSession(ssl, nativeSslSession.session());
             if (reused) {
-                if (singleUsed) {
-                    // Should only be used once
-                    nativeSslSession.invalidate();
-                    session.invalidate();
-                }
-                nativeSslSession.setLastAccessedTime(System.currentTimeMillis());
-                session.setSessionDetails(nativeSslSession.getCreationTime(), nativeSslSession.getLastAccessedTime(),
-                        nativeSslSession.sessionId(), nativeSslSession.keyValueStorage);
+                singleUsed = nativeSslSession.shouldBeSingleUse();
             }
-            return reused;
         }
-        // Couldn't find a valid session that could be used.
-        return false;
+
+        if (reused) {
+            if (singleUsed) {
+                // Should only be used once
+                nativeSslSession.invalidate();
+                session.invalidate();
+            }
+            nativeSslSession.setLastAccessedTime(System.currentTimeMillis());
+            session.setSessionDetails(nativeSslSession.getCreationTime(), nativeSslSession.getLastAccessedTime(),
+                    nativeSslSession.sessionId(), nativeSslSession.keyValueStorage);
+        }
+        return reused;
     }
 
     private static HostPort keyFor(String host, int port) {
@@ -155,6 +138,12 @@ final class OpenSslClientSessionCache extends OpenSslSessionCache {
             return null;
         }
         return new HostPort(host, port);
+    }
+
+    @Override
+    synchronized void clear() {
+        super.clear();
+        sessions.clear();
     }
 
     /**

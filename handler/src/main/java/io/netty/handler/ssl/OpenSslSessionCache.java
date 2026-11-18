@@ -27,30 +27,18 @@ import javax.security.cert.X509Certificate;
 import java.security.Principal;
 import java.security.cert.Certificate;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.atomic.AtomicReferenceArray;
-import java.util.function.BiFunction;
 
 /**
  * {@link SSLSessionCache} implementation for our native SSL implementation.
- * <p>
- * The cache is called from every thread that runs a handshake and does not use a lock:
- * <ul>
- *   <li>sessions are looked up in a {@link ConcurrentHashMap},</li>
- *   <li>the insertion order, which is the order in which sessions are evicted and time out, is kept in a
- *   {@link Ring} that is as big as the cache: a new session takes the next slot and evicts the session that was
- *   stored there,</li>
- *   <li>a {@link NativeSslSession} is pinned while its {@code SSL_SESSION*} is used, so a concurrent removal can
- *   never free it under the feet of another thread.</li>
- * </ul>
  */
 class OpenSslSessionCache implements SSLSessionCache {
+    private static final OpenSslInternalSession[] EMPTY_SESSIONS = new OpenSslInternalSession[0];
+
     private static final int DEFAULT_CACHE_SIZE;
     static {
         // Respect the same system property as the JDK implementation to make it easy to switch between implementations.
@@ -66,10 +54,6 @@ class OpenSslSessionCache implements SSLSessionCache {
     private final ConcurrentHashMap<OpenSslSessionId, NativeSslSession> sessions =
             new ConcurrentHashMap<OpenSslSessionId, NativeSslSession>();
 
-    // Created once the first session is stored, as most of the time there are a lot more contexts than contexts
-    // that cache sessions.
-    private final AtomicReference<Ring> ring = new AtomicReference<Ring>();
-
     private final AtomicInteger maximumCacheSize = new AtomicInteger(DEFAULT_CACHE_SIZE);
 
     // Let's use the same default value as OpenSSL does.
@@ -84,8 +68,7 @@ class OpenSslSessionCache implements SSLSessionCache {
     final void setSessionTimeout(int seconds) {
         int oldTimeout = sessionTimeout.getAndSet(seconds);
         if (oldTimeout > seconds) {
-            // Drain the whole cache as this way we can use the insertion order to detect early
-            // if there are any other sessions left that are invalid.
+            // Just keep it simple for now and drain the whole cache.
             clear();
         }
     }
@@ -112,11 +95,9 @@ class OpenSslSessionCache implements SSLSessionCache {
     protected void sessionRemoved(NativeSslSession session) { }
 
     final void setSessionCacheSize(int size) {
-        int oldSize = maximumCacheSize.getAndSet(size);
-        if (oldSize != size) {
-            // Just keep it simple for now and drain the whole cache. The next session that is stored creates a ring
-            // with the new size.
-            ring.set(null);
+        long oldSize = maximumCacheSize.getAndSet(size);
+        if (oldSize > size || size == 0) {
+            // Just keep it simple for now and drain the whole cache.
             clear();
         }
     }
@@ -125,54 +106,26 @@ class OpenSslSessionCache implements SSLSessionCache {
         return maximumCacheSize.get();
     }
 
-    private Ring ring() {
-        for (;;) {
-            Ring current = ring.get();
-            if (current != null) {
-                return current;
-            }
-            int capacity = maximumCacheSize.get();
-            if (capacity <= 0) {
-                return null;
-            }
-            Ring created = new Ring(capacity);
-            if (ring.compareAndSet(null, created)) {
-                if (capacity == maximumCacheSize.get()) {
-                    return created;
-                }
-                // The size was changed while we created the ring, start over with the new size.
-                ring.compareAndSet(created, null);
+    private void expungeInvalidSessions() {
+        long now = System.currentTimeMillis();
+        for (NativeSslSession session : sessions.values()) {
+            if (!session.isValid(now)) {
+                remove(session);
             }
         }
     }
 
-    private void expungeInvalidSessions() {
-        Ring current = ring.get();
-        if (current == null) {
+    /**
+     * The sessions are not ordered, so once the cache is full we evict whatever session the map gives us first.
+     */
+    private void evictIfFull() {
+        int maxSize = maximumCacheSize.get();
+        if (maxSize < 0) {
             return;
         }
-        long now = System.currentTimeMillis();
-        int capacity = current.slots.length();
-        for (;;) {
-            long head = current.head.get();
-            long tail = current.tail.get();
-            // Everything before head - capacity was already overwritten.
-            long eldest = Math.max(tail, head - capacity);
-            if (eldest >= head) {
-                return;
-            }
-            int idx = (int) (eldest % capacity);
-            NativeSslSession session = current.slots.get(idx);
-            // The slots are filled in insertion order, so we can stop as soon as we find a valid session.
-            // This is true as we always drain the cache as soon as we change the timeout to a smaller value as
-            // it was set before. This way its true that the insertion order matches the timeout order.
-            if (session != null && session.isValid(now)) {
-                return;
-            }
-            if (current.tail.compareAndSet(tail, eldest + 1) && session != null &&
-                    current.slots.compareAndSet(idx, session, null)) {
-                remove(session);
-            }
+        Iterator<NativeSslSession> iterator = sessions.values().iterator();
+        while (sessions.size() > maxSize && iterator.hasNext()) {
+            remove(iterator.next());
         }
     }
 
@@ -197,67 +150,47 @@ class OpenSslSessionCache implements SSLSessionCache {
             expungeInvalidSessions();
         }
 
-        Ring current = ring();
-        if (current == null || !sessionCreated(session)) {
+        if (!sessionCreated(session)) {
             // Should not be cached, return false. In this case we also need to call close() to ensure we
             // close the ResourceLeakTracker.
             session.close();
             return false;
         }
-        NativeSslSession old = sessions.put(session.sessionId(), session);
+        final NativeSslSession old = sessions.put(session.sessionId(), session);
         if (old != null) {
             notifyRemovalAndFree(old);
         }
-        int idx = (int) (current.head.getAndIncrement() % current.slots.length());
-        NativeSslSession evicted = current.slots.getAndSet(idx, session);
-        if (evicted != null) {
-            remove(evicted);
-        }
-        if (current != ring.get()) {
-            // The cache was resized and drained while we stored the session, so nothing would ever evict it.
-            remove(session);
-        }
+        evictIfFull();
         return true;
     }
 
     @Override
     public final long getSession(long ssl, byte[] sessionId) {
-        final NativeSslSession session = sessions.get(new OpenSslSessionId(sessionId));
+        OpenSslSessionId id = new OpenSslSessionId(sessionId);
+        final NativeSslSession session = sessions.get(id);
         if (session == null) {
             return -1;
         }
 
         // If the session is not valid anymore we should remove it from the cache and just signal back
         // that we couldn't find a session that is re-usable.
-        if (!session.isValid()) {
+        if (!session.isValid() ||
+                // This fails if the session was removed from the cache and destroyed in the meantime, or if there
+                // is something wrong. In this case just remove the session from the cache and signal back that we
+                // couldn't find a session for re-use.
+                !session.upRef()) {
             // Remove the session from the cache. This will also take care of calling SSL_SESSION_free(...)
             remove(session);
             return -1;
         }
-        // Pin the session so we ensure we never destroy it before we incremented the reference count.
-        if (!session.acquire()) {
-            // The session was removed from the cache in the meantime.
-            return -1;
-        }
-        final long pointer;
-        final boolean upRef;
-        final boolean singleUse;
-        try {
-            pointer = session.session();
-            // If we cant increment the reference count there is something wrong. In this case just remove the
-            // session from the cache and signal back that we couldn't find a session for re-use.
-            upRef = session.upRef();
-            singleUse = upRef && session.shouldBeSingleUse();
-        } finally {
-            session.release();
-        }
-        if (!upRef || singleUse) {
-            // Either broken or should only be used once. In this case remove the session from the cache, which
-            // will also call SSL_SESSION_free(...) for the reference that is held by the cache.
+
+        // At this point we already incremented the reference count via SSL_SESSION_up_ref(...), so the native
+        // session stays alive even if it is removed from the cache concurrently.
+        final long pointer = session.session;
+        if (SSLSession.shouldBeSingleUse(pointer)) {
+            // Should only be used once. In this case invalidate the session which will also ensure we remove it
+            // from the cache and call SSL_SESSION_free(...).
             remove(session);
-            if (!upRef) {
-                return -1;
-            }
         }
         session.setLastAccessedTime(System.currentTimeMillis());
         ReferenceCountedOpenSslEngine engine = engines.get(ssl);
@@ -285,26 +218,16 @@ class OpenSslSessionCache implements SSLSessionCache {
         }
     }
 
-    /**
-     * Remove exactly this session from the cache, if it is still in there.
-     */
-    final void remove(final NativeSslSession session) {
-        OpenSslSessionId id = session.sessionId();
-        if (sessions.get(id) != session) {
-            return;
-        }
-        // We can't use remove(key, value) as this would also remove another session with the same id, because of
-        // how NativeSslSession.equals(...) is implemented.
+    private void remove(final NativeSslSession session) {
+        // We can't use remove(key, value) as NativeSslSession.equals(...) only compares the ids, so it could remove
+        // a newer session with the same id.
         final boolean[] removed = new boolean[1];
-        sessions.computeIfPresent(id, new BiFunction<OpenSslSessionId, NativeSslSession, NativeSslSession>() {
-            @Override
-            public NativeSslSession apply(OpenSslSessionId key, NativeSslSession current) {
-                if (current != session) {
-                    return current;
-                }
-                removed[0] = true;
-                return null;
+        sessions.computeIfPresent(session.sessionId(), (id, current) -> {
+            if (current != session) {
+                return current;
             }
+            removed[0] = true;
+            return null;
         });
         if (removed[0]) {
             notifyRemovalAndFree(session);
@@ -320,7 +243,7 @@ class OpenSslSessionCache implements SSLSessionCache {
 
     private void notifyRemovalAndFree(NativeSslSession session) {
         sessionRemoved(session);
-        session.retire();
+        session.free();
     }
 
     /**
@@ -341,10 +264,10 @@ class OpenSslSessionCache implements SSLSessionCache {
      * Returns a snapshot of the session ids of the current valid sessions.
      */
     final List<OpenSslSessionId> getIds() {
-        List<OpenSslSessionId> ids = new ArrayList<OpenSslSessionId>(sessions.size());
-        long now = System.currentTimeMillis();
-        for (NativeSslSession session: sessions.values()) {
-            if (session.isValid(now)) {
+        final OpenSslInternalSession[] sessionsArray = sessions.values().toArray(EMPTY_SESSIONS);
+        List<OpenSslSessionId> ids = new ArrayList<OpenSslSessionId>(sessionsArray.length);
+        for (OpenSslInternalSession session: sessionsArray) {
+            if (session.isValid()) {
                 ids.add(session.sessionId());
             }
         }
@@ -355,24 +278,9 @@ class OpenSslSessionCache implements SSLSessionCache {
      * Clear the cache and free all cached SSL_SESSION*.
      */
     void clear() {
-        for (NativeSslSession session: sessions.values()) {
+        for (NativeSslSession session : sessions.values()) {
             // Notify about removal. This also takes care of calling SSL_SESSION_free(...).
             remove(session);
-        }
-    }
-
-    /**
-     * The sessions in the order they were stored. A new session overwrites, and so evicts, the oldest one.
-     */
-    private static final class Ring {
-        final AtomicReferenceArray<NativeSslSession> slots;
-        // The position of the next session that is stored.
-        final AtomicLong head = new AtomicLong();
-        // The position of the oldest session that was not expunged yet.
-        final AtomicLong tail = new AtomicLong();
-
-        Ring(int capacity) {
-            slots = new AtomicReferenceArray<NativeSslSession>(capacity);
         }
     }
 
@@ -394,15 +302,7 @@ class OpenSslSessionCache implements SSLSessionCache {
         private final long creationTime = System.currentTimeMillis();
         private volatile long lastAccessedTime = creationTime;
         private volatile boolean valid = true;
-
-        // The number of threads that currently use the native session, with RETIRED set once the session was
-        // removed from the cache. The native session is freed by whoever moves the state from RETIRED to FREED,
-        // which is only possible once nobody uses it anymore.
-        private static final int RETIRED = 0x80000000;
-        private static final int FREED = 0xC0000000;
-        private static final AtomicIntegerFieldUpdater<NativeSslSession> STATE =
-                AtomicIntegerFieldUpdater.newUpdater(NativeSslSession.class, "state");
-        private volatile int state;
+        private boolean freed;
 
         NativeSslSession(long session, String peerHost, int peerPort, long timeout,
                          Map<String, Object> keyValueStorage) {
@@ -432,69 +332,29 @@ class OpenSslSessionCache implements SSLSessionCache {
         }
 
         boolean shouldBeSingleUse() {
-            assert state != FREED;
+            assert !freed;
             return SSLSession.shouldBeSingleUse(session);
         }
 
         long session() {
-            assert state != FREED;
+            assert !freed;
             return session;
         }
 
-        boolean upRef() {
-            assert state != FREED;
-            return SSLSession.upRef(session);
+        // Synchronized together with free() so we never increment the reference count of a session that was
+        // destroyed because it was removed from the cache by another thread.
+        synchronized boolean upRef() {
+            return !freed && SSLSession.upRef(session);
         }
 
-        /**
-         * Ensure the native session is not freed until {@link #release()} is called.
-         *
-         * @return {@code false} if the session was already removed from the cache and so can't be used anymore.
-         */
-        boolean acquire() {
-            for (;;) {
-                int current = state;
-                if (current < 0) {
-                    return false;
-                }
-                if (STATE.compareAndSet(this, current, current + 1)) {
-                    return true;
-                }
-            }
-        }
-
-        void release() {
-            if (STATE.decrementAndGet(this) == RETIRED) {
-                freeIfUnused();
-            }
-        }
-
-        /**
-         * Called once the session was removed from the cache. Calls SSL_SESSION_free(...) as soon as no thread
-         * uses the native session anymore, which is usually right away.
-         */
-        void retire() {
-            invalidate();
-            for (;;) {
-                int current = state;
-                if (current < 0) {
-                    return;
-                }
-                if (STATE.compareAndSet(this, current, current | RETIRED)) {
-                    freeIfUnused();
-                    return;
-                }
-            }
-        }
-
-        private void freeIfUnused() {
-            if (STATE.compareAndSet(this, RETIRED, FREED)) {
-                close();
-                SSLSession.free(session);
-            }
+        synchronized void free() {
+            close();
+            SSLSession.free(session);
         }
 
         void close() {
+            assert !freed;
+            freed = true;
             invalidate();
             if (leakTracker != null) {
                 leakTracker.close(this);
