@@ -78,7 +78,7 @@ class OpenSslSessionCache implements SSLSessionCache {
         this.engines = engines;
     }
 
-    final void setSessionTimeout(int seconds) {
+    void setSessionTimeout(int seconds) {
         int oldTimeout = sessionTimeout.getAndSet(seconds);
         if (oldTimeout > seconds) {
             // Drain the whole cache as this way we can use the ordering of the LinkedHashMap to detect early
@@ -108,7 +108,7 @@ class OpenSslSessionCache implements SSLSessionCache {
      */
     protected void sessionRemoved(NativeSslSession session) { }
 
-    final void setSessionCacheSize(int size) {
+    void setSessionCacheSize(int size) {
         long oldSize = maximumCacheSize.getAndSet(size);
         if (oldSize > size || size == 0) {
             // Just keep it simple for now and drain the whole cache.
@@ -116,7 +116,7 @@ class OpenSslSessionCache implements SSLSessionCache {
         }
     }
 
-    final int getSessionCacheSize() {
+    int getSessionCacheSize() {
         return maximumCacheSize.get();
     }
 
@@ -178,7 +178,7 @@ class OpenSslSessionCache implements SSLSessionCache {
     }
 
     @Override
-    public final long getSession(long ssl, byte[] sessionId) {
+    public long getSession(long ssl, byte[] sessionId) {
         OpenSslSessionId id = new OpenSslSessionId(sessionId);
         final NativeSslSession session;
         synchronized (this) {
@@ -226,7 +226,7 @@ class OpenSslSessionCache implements SSLSessionCache {
     /**
      * Remove the session with the given id from the cache
      */
-    final synchronized void removeSessionWithId(OpenSslSessionId id) {
+    synchronized void removeSessionWithId(OpenSslSessionId id) {
         NativeSslSession sslSession = sessions.remove(id);
         if (sslSession != null) {
             notifyRemovalAndFree(sslSession);
@@ -236,7 +236,7 @@ class OpenSslSessionCache implements SSLSessionCache {
     /**
      * Returns {@code true} if there is a session for the given id in the cache.
      */
-    final synchronized boolean containsSessionWithId(OpenSslSessionId id) {
+    synchronized boolean containsSessionWithId(OpenSslSessionId id) {
         return sessions.containsKey(id);
     }
 
@@ -248,7 +248,7 @@ class OpenSslSessionCache implements SSLSessionCache {
     /**
      * Return the {@link OpenSslInternalSession} which is cached for the given id.
      */
-    final synchronized OpenSslInternalSession getSession(OpenSslSessionId id) {
+    synchronized OpenSslInternalSession getSession(OpenSslSessionId id) {
         NativeSslSession session = sessions.get(id);
         if (session != null && !session.isValid()) {
             // The session is not valid anymore, let's remove it and just signal back that there is no session
@@ -262,7 +262,7 @@ class OpenSslSessionCache implements SSLSessionCache {
     /**
      * Returns a snapshot of the session ids of the current valid sessions.
      */
-    final List<OpenSslSessionId> getIds() {
+    List<OpenSslSessionId> getIds() {
         final OpenSslInternalSession[] sessionsArray;
         synchronized (this) {
             sessionsArray = sessions.values().toArray(EMPTY_SESSIONS);
@@ -355,6 +355,60 @@ class OpenSslSessionCache implements SSLSessionCache {
         synchronized void free() {
             close();
             SSLSession.free(session);
+        }
+
+        private static final int RETIRED = 0x80000000;
+        private static final int FREED = 0xC0000000;
+        private static final java.util.concurrent.atomic.AtomicIntegerFieldUpdater<NativeSslSession> STATE =
+                java.util.concurrent.atomic.AtomicIntegerFieldUpdater.newUpdater(NativeSslSession.class, "state");
+        private volatile int state;
+
+        /**
+         * Pins the native {@code SSL_SESSION*} so it can't be freed until {@link #release()} is called.
+         * Returns {@code false} if the session was already retired.
+         */
+        boolean acquire() {
+            for (;;) {
+                int s = state;
+                if (s < 0) {
+                    return false;
+                }
+                if (STATE.compareAndSet(this, s, s + 1)) {
+                    return true;
+                }
+            }
+        }
+
+        void release() {
+            if (STATE.decrementAndGet(this) == RETIRED) {
+                freeIfUnused();
+            }
+        }
+
+        /**
+         * Marks the session as removed from the cache. The native session is freed as soon as nobody pins it.
+         * Returns {@code true} if this call retired the session.
+         */
+        boolean retire() {
+            for (;;) {
+                int s = state;
+                if (s < 0) {
+                    return false;
+                }
+                if (STATE.compareAndSet(this, s, s | RETIRED)) {
+                    valid = false;
+                    if (s == 0) {
+                        freeIfUnused();
+                    }
+                    return true;
+                }
+            }
+        }
+
+        private void freeIfUnused() {
+            if (STATE.compareAndSet(this, RETIRED, FREED)) {
+                free();
+            }
         }
 
         void close() {
