@@ -27,10 +27,10 @@ import javax.security.cert.X509Certificate;
 import java.security.Principal;
 import java.security.cert.Certificate;
 import java.util.ArrayList;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -60,6 +60,7 @@ class OpenSslSessionCache implements SSLSessionCache {
     // See https://www.openssl.org/docs/man1.1.1/man3/SSL_get_default_timeout.html
     private final AtomicInteger sessionTimeout = new AtomicInteger(300);
     private final AtomicInteger sessionCounter = new AtomicInteger();
+    private final AtomicBoolean evicting = new AtomicBoolean();
 
     OpenSslSessionCache(OpenSslEngineMap engines) {
         this.engines = engines;
@@ -116,23 +117,34 @@ class OpenSslSessionCache implements SSLSessionCache {
     }
 
     /**
-     * The sessions are not ordered, so once the cache is full we evict whatever session the map gives us first.
-     * The only guarantee is that the session that was just stored is the last one to go.
+     * The sessions are not ordered, so there is no eldest session we could evict once the cache is full. Going
+     * through the map for every stored session would be too expensive, so we make room for more than one session:
+     * everything that timed out and, if that is not enough, every 8th session until an eighth of the cache is free.
+     * The session that was just stored is never evicted, unless the cache should not hold any session at all.
      */
     private void evictIfFull(NativeSslSession stored) {
         int maxSize = maximumCacheSize.get();
-        if (maxSize < 0) {
+        if (maxSize < 0 || sessions.size() <= maxSize || !evicting.compareAndSet(false, true)) {
+            // Not full, or another thread is making room already.
             return;
         }
-        Iterator<NativeSslSession> iterator = sessions.values().iterator();
-        while (sessions.size() > maxSize && iterator.hasNext()) {
-            NativeSslSession session = iterator.next();
-            if (session != stored) {
-                remove(session);
+        try {
+            int targetSize = maxSize - maxSize / 8;
+            long now = System.currentTimeMillis();
+            int candidates = 0;
+            for (NativeSslSession session : sessions.values()) {
+                if (session == stored) {
+                    continue;
+                }
+                if (!session.isValid(now) || sessions.size() > targetSize && (candidates++ & 7) == 0) {
+                    remove(session);
+                }
             }
-        }
-        if (sessions.size() > maxSize) {
-            remove(stored);
+            if (sessions.size() > maxSize) {
+                remove(stored);
+            }
+        } finally {
+            evicting.set(false);
         }
     }
 
@@ -153,7 +165,9 @@ class OpenSslSessionCache implements SSLSessionCache {
                 session.creationTime, session.lastAccessedTime, session.sessionId(), session.keyValueStorage);
         // Mimic what OpenSSL is doing and expunge every 255 new sessions
         // See https://www.openssl.org/docs/man1.0.2/man3/SSL_CTX_flush_sessions.html
-        if (sessionCounter.incrementAndGet() % 255 == 0) {
+        // We need to go through all sessions to find the invalid ones, so for a big cache we do it less often.
+        if (sessionCounter.incrementAndGet() >= Math.max(255, sessions.size())) {
+            sessionCounter.set(0);
             expungeInvalidSessions();
         }
 
