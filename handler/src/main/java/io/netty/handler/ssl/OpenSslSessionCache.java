@@ -117,15 +117,22 @@ class OpenSslSessionCache implements SSLSessionCache {
 
     /**
      * The sessions are not ordered, so once the cache is full we evict whatever session the map gives us first.
+     * The only guarantee is that the session that was just stored is the last one to go.
      */
-    private void evictIfFull() {
+    private void evictIfFull(NativeSslSession stored) {
         int maxSize = maximumCacheSize.get();
         if (maxSize < 0) {
             return;
         }
         Iterator<NativeSslSession> iterator = sessions.values().iterator();
         while (sessions.size() > maxSize && iterator.hasNext()) {
-            remove(iterator.next());
+            NativeSslSession session = iterator.next();
+            if (session != stored) {
+                remove(session);
+            }
+        }
+        if (sessions.size() > maxSize) {
+            remove(stored);
         }
     }
 
@@ -160,7 +167,7 @@ class OpenSslSessionCache implements SSLSessionCache {
         if (old != null) {
             notifyRemovalAndFree(old);
         }
-        evictIfFull();
+        evictIfFull(session);
         return true;
     }
 
